@@ -617,6 +617,87 @@ def test_network_cli_connect_ansible_error_propagates(conn):
     assert "ansible error" in str(excinfo.value)
 
 
+def _refusing_ssh_type_conn(conn, side_effect, retries):
+    conn.set_options(direct={"ssh_type": "libssh", "network_cli_retries": retries})
+    conn._ssh_type_conn = MagicMock()
+    conn._ssh_type_conn._connect = MagicMock(side_effect=side_effect)
+    conn._ssh_type_conn._set_log_channel = MagicMock()
+    conn._ssh_type_conn.force_persistence = False
+
+
+REFUSED = "ssh connection failed: ssh connect failed: Socket error: disconnected"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [REFUSED, "ssh connection failed: ssh connect failed: Socket error: Connection reset by peer"],
+)
+def test_network_cli_connect_retries_when_closed_before_login(conn, monkeypatch, message):
+    sleeps = []
+    monkeypatch.setattr(
+        "ansible_collections.ansible.netcommon.plugins.connection.network_cli.time.sleep",
+        sleeps.append,
+    )
+    mock_ssh = MagicMock()
+    mock_ssh.ssh.invoke_shell.return_value = MagicMock()
+    _refusing_ssh_type_conn(
+        conn,
+        [AnsibleConnectionFailure(message), AnsibleConnectionFailure(message), mock_ssh],
+        retries=3,
+    )
+    conn._play_context.become = False
+    conn._terminal = _make_terminal_mock()
+    conn._ssh_shell = None
+    conn.receive = MagicMock()
+
+    conn._connect()
+
+    assert conn._ssh_type_conn._connect.call_count == 3
+    assert sleeps == [2, 4]
+
+
+def test_network_cli_connect_closed_before_login_retries_exhausted(conn, monkeypatch):
+    monkeypatch.setattr(
+        "ansible_collections.ansible.netcommon.plugins.connection.network_cli.time.sleep",
+        lambda seconds: None,
+    )
+    _refusing_ssh_type_conn(conn, AnsibleConnectionFailure(REFUSED), retries=2)
+
+    with pytest.raises(AnsibleConnectionFailure) as excinfo:
+        conn._connect()
+    assert "Socket error: disconnected" in str(excinfo.value)
+    assert conn._ssh_type_conn._connect.call_count == 3
+
+
+def test_network_cli_connect_closed_before_login_stops_at_the_timeouts(conn, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(
+        "ansible_collections.ansible.netcommon.plugins.connection.network_cli.time.sleep",
+        sleeps.append,
+    )
+    _refusing_ssh_type_conn(conn, AnsibleConnectionFailure(REFUSED), retries=10)
+    conn.set_options(direct={"persistent_connect_timeout": 10, "persistent_command_timeout": 30})
+
+    with pytest.raises(AnsibleConnectionFailure):
+        conn._connect()
+    # The pauses stop once they add up to the shorter timeout.
+    assert sleeps == [2, 4, 8]
+
+
+def test_network_cli_connect_authentication_failure_is_not_retried(conn):
+    _refusing_ssh_type_conn(
+        conn,
+        AnsibleConnectionFailure(
+            "ssh connection failed: Failed to authenticate public key: Access denied"
+        ),
+        retries=3,
+    )
+
+    with pytest.raises(AnsibleConnectionFailure, match="Access denied"):
+        conn._connect()
+    assert conn._ssh_type_conn._connect.call_count == 1
+
+
 # ---- _ParamikoConnection ----
 def test_paramiko_connection_get_option_from_defaults():
     from ansible_collections.ansible.netcommon.plugins.connection.network_cli import (

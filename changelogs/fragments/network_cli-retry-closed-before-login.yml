@@ -1,0 +1,8 @@
+---
+bugfixes:
+  - "network_cli connection plugin - retry connecting, as ``network_cli_retries`` describes, when the remote host
+    closes the connection before login (libssh ``Socket error: disconnected`` or ``Connection reset by peer``).
+    Such failures are reported as Ansible errors, which were never retried. Some devices refuse new SSH
+    connections this way for a while after the previous one, such as an ICX 6610 running FastIron 08.0.30,
+    for up to a minute. Other connection failures reported as Ansible errors, such as failed authentication,
+    are still not retried."
