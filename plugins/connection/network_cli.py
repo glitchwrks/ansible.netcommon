@@ -247,6 +247,9 @@ options:
       increases after every attempt by power of 2 in seconds till either the maximum
       attempts are exhausted or any of the C(persistent_command_timeout) or C(persistent_connect_timeout)
       timers are triggered.
+    - Connection failures reported as Ansible errors, such as failed authentication, are not retried, except
+      when the remote host closed the connection before login. Some devices do that while they refuse new
+      SSH connections for a while, for example right after a previous connection.
     default: 3
     type: integer
     env:
@@ -918,6 +921,23 @@ class _ParamikoConnection:
         self._connected = False
 
 
+# pylibssh reports a failure before login as "ssh connect failed: ...". These
+# are the ones where the remote host closed the connection, rather than
+# refusing it outright or failing key exchange, as devices do while they
+# refuse new SSH connections for a while. An ICX 6610 running FastIron
+# 08.0.30, for example, refuses them for up to a minute after the last one.
+_REFUSED_BEFORE_LOGIN = (
+    "ssh connect failed: Socket error: disconnected",
+    "ssh connect failed: Socket error: Connection reset by peer",
+)
+
+
+def _refused_before_login(exc):
+    """Whether a connection failure means the remote host closed the connection before login."""
+    message = to_text(exc, errors="surrogate_or_strict")
+    return any(text in message for text in _REFUSED_BEFORE_LOGIN)
+
+
 def ensure_connect(func):
     @wraps(func)
     def wrapped(self, *args, **kwargs):
@@ -1217,8 +1237,20 @@ class Connection(NetworkConnectionBase):
                 try:
                     ssh = self.ssh_type_conn._connect()
                     break
-                except AnsibleError:
-                    raise
+                except AnsibleError as e:
+                    if not _refused_before_login(e):
+                        raise
+                    pause = 2 ** (attempt + 1)
+                    if attempt == retries or total_pause >= max_pause:
+                        raise
+                    self.queue_message(
+                        "vv",
+                        "network_cli_retry: attempt: %d, the remote host closed the connection "
+                        "before login (%s), pausing for %d seconds"
+                        % (attempt + 1, to_text(e, errors="surrogate_or_strict"), pause),
+                    )
+                    time.sleep(pause)
+                    total_pause += pause
                 except Exception as e:
                     pause = 2 ** (attempt + 1)
                     if attempt == retries or total_pause >= max_pause:
